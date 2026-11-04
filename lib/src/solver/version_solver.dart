@@ -14,6 +14,7 @@ import '../log.dart' as log;
 import '../package.dart';
 import '../package_name.dart';
 import '../pubspec.dart';
+import '../source/git.dart';
 import '../source/hosted.dart';
 import '../source/unknown.dart';
 import '../system_cache.dart';
@@ -147,15 +148,19 @@ class VersionSolver {
     );
 
     try {
-      return await _systemCache.hosted.withPrefetching(_systemCache, () async {
-        String? next = _root.name;
-        while (next != null) {
-          _propagate(next);
-          next = await _choosePackageVersion();
-        }
+      return await _systemCache.git.withPrefetching(
+        _prefetchGit,
+        () => _systemCache.hosted.withPrefetching(_systemCache, () async {
+          _prefetchKnownGitRepos();
+          String? next = _root.name;
+          while (next != null) {
+            _propagate(next);
+            next = await _choosePackageVersion();
+          }
 
-        return await _result();
-      });
+          return await _result();
+        }),
+      );
     } finally {
       // Gather some solving metrics.
       log.solver(
@@ -617,6 +622,39 @@ class VersionSolver {
         sdkOverrides: _sdkOverrides,
       );
     });
+  }
+
+  /// Starts fetching the repository of the git package [ref] in the
+  /// background, unless the solve will not need to list its versions:
+  /// overridden, a root package, or locked at that same ref.
+  void _prefetchGit(PackageRef ref) {
+    if (_overriddenPackages.contains(ref.name)) return;
+    if (_rootPackages.containsKey(ref.name)) return;
+    final locked = _getLocked(ref.name);
+    if (locked != null && locked.toRef() == ref) return;
+    final description = ref.description;
+    if (description is GitDescription) {
+      _systemCache.git.prefetch(description, _systemCache);
+    }
+  }
+
+  /// Prefetches the git repositories known before solving: the git packages
+  /// of the lock file (all of them on upgrade, the unlocked ones on get) and
+  /// the direct git dependencies of the root packages.
+  void _prefetchKnownGitRepos() {
+    for (final id in _lockFile.packages.values) {
+      if (id.description.description is GitDescription) {
+        _prefetchGit(id.toRef());
+      }
+    }
+    for (final package in _root.transitiveWorkspace) {
+      for (final range in [
+        ...package.dependencies.values,
+        ...package.devDependencies.values,
+      ]) {
+        if (range.source is GitSource) _prefetchGit(range.toRef());
+      }
+    }
   }
 
   /// Gets the version of [package] currently locked in the lock file.

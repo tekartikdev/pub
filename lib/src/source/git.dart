@@ -446,6 +446,7 @@ class GitSource extends CachedSource {
       } else {
         final revision = await _firstRevision(path, description.ref);
         final pubspec = await _describeUncached(ref, revision, cache);
+        _scheduleDependencies(pubspec);
         return [
           PackageId(
             ref.name,
@@ -718,29 +719,31 @@ class GitSource extends CachedSource {
     SystemCache cache,
   ) async {
     final path = _repoCachePath(description, cache);
-    if (cache.gitCache.updatedRepos.contains(path)) {
-      await _firstRevision(path, revision);
-      return false;
-    }
+    return await cache.gitCache.repoLock(path).withResource(() async {
+      if (cache.gitCache.updatedRepos.contains(path)) {
+        await _firstRevision(path, revision);
+        return false;
+      }
 
-    await _deleteGitRepoIfInvalid(path);
+      await _deleteGitRepoIfInvalid(path);
 
-    if (!entryExists(path)) {
-      await _createRepoCache(description, cache);
-      await _firstRevision(path, revision);
-      return true;
-    }
+      if (!entryExists(path)) {
+        await _createRepoCache(description, cache);
+        await _firstRevision(path, revision);
+        return true;
+      }
 
-    // Try to list the revision. If it doesn't exist, git will fail and we'll
-    // know we have to update the repository.
-    try {
-      await _revParse(path, revision);
-      return false;
-    } on git.GitException catch (_) {
-      await _updateRepoCache(description, cache);
-      await _firstRevision(path, revision);
-      return true;
-    }
+      // Try to list the revision. If it doesn't exist, git will fail and
+      // we'll know we have to update the repository.
+      try {
+        await _revParse(path, revision);
+        return false;
+      } on git.GitException catch (_) {
+        await _updateRepoCache(description, cache);
+        await _firstRevision(path, revision);
+        return true;
+      }
+    });
   }
 
   /// Ensures that the canonical clone of the repository referred to by
@@ -753,14 +756,62 @@ class GitSource extends CachedSource {
   ) async {
     final path = _repoCachePath(description, cache);
     if (cache.gitCache.updatedRepos.contains(path)) return false;
+    return await cache.gitCache.repoLock(path).withResource(() async {
+      // A concurrent caller (a prefetch) may have updated it meanwhile.
+      if (cache.gitCache.updatedRepos.contains(path)) return false;
 
-    await _deleteGitRepoIfInvalid(path);
+      await _deleteGitRepoIfInvalid(path);
 
-    if (!entryExists(path)) {
-      await _createRepoCache(description, cache);
-      return true;
-    } else {
-      return await _updateRepoCache(description, cache);
+      if (!entryExists(path)) {
+        await _createRepoCache(description, cache);
+        return true;
+      } else {
+        return await _updateRepoCache(description, cache);
+      }
+    });
+  }
+
+  /// Starts fetching (or cloning) the repository of [description] in the
+  /// background, so that a later [doGetVersions] finds it up to date.
+  ///
+  /// Errors are only logged: the later regular call fetches again and reports
+  /// them.
+  void prefetch(GitDescription description, SystemCache cache) {
+    if (!git.isInstalled) return;
+    final path = _repoCachePath(description, cache);
+    final gitCache = cache.gitCache;
+    if (gitCache.updatedRepos.contains(path)) return;
+    gitCache.prefetches.putIfAbsent(path, () async {
+      try {
+        log.fine('Prefetching ${description.url}');
+        ensureDir(p.join(cache.rootDirForSource(this), 'cache'));
+        await gitCache.pool.withResource(
+          () => _ensureRepoCache(description, cache),
+        );
+      } catch (e) {
+        log.fine('Prefetch of ${description.url} failed: $e');
+      }
+    });
+  }
+
+  /// Runs [callback] with speculative prefetching of git dependencies.
+  ///
+  /// While it runs, each git package described by [doGetVersions] passes its
+  /// git dependencies to [schedule], which decides whether to [prefetch]
+  /// them (it knows about locked and overridden packages).
+  Future<T> withPrefetching<T>(
+    void Function(PackageRef ref) schedule,
+    Future<T> Function() callback,
+  ) => runZoned(callback, zoneValues: {_prefetchingKey: schedule});
+
+  static const _prefetchingKey = #_gitPrefetch;
+
+  void _scheduleDependencies(Pubspec pubspec) {
+    final schedule =
+        Zone.current[_prefetchingKey] as void Function(PackageRef)?;
+    if (schedule == null) return;
+    for (final range in pubspec.dependencies.values) {
+      if (range.source is GitSource) schedule(range.toRef());
     }
   }
 
@@ -1408,8 +1459,33 @@ RegExp compileTagPattern(String tagPattern) {
 
 /// State that is cached for the GitSource.
 final class GitSourceCache {
-  /// Limit the number of concurrent git operations to 1.
-  final pool = Pool(1);
+  /// Limits the number of concurrent git operations.
+  ///
+  /// Operations on the same canonical clone are serialized by [repoLock].
+  ///
+  /// `PUB_GIT_CONCURRENCY` overrides the default (8); 1 gives back the old
+  /// one-at-a-time behavior.
+  final pool = Pool(_concurrency);
+
+  static final int _concurrency = () {
+    final value = int.tryParse(
+      Platform.environment['PUB_GIT_CONCURRENCY'] ?? '',
+    );
+    return (value != null && value > 0) ? value : 8;
+  }();
+
+  final _repoLocks = <String, Pool>{};
+
+  /// Serializes the operations changing the canonical clone at [path] (clone,
+  /// fetch, invalid repo cleanup).
+  ///
+  /// Always taken while already holding a [pool] resource, never the other
+  /// way around, so the two cannot deadlock.
+  Pool repoLock(String path) => _repoLocks.putIfAbsent(path, () => Pool(1));
+
+  /// Pending background fetches started by [GitSource.prefetch], by canonical
+  /// clone path.
+  final prefetches = <String, Future<void>>{};
 
   /// A map from revision cache locations to futures that will complete once
   /// they're finished being cloned.
